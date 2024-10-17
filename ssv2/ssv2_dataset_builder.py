@@ -91,40 +91,17 @@ class Ssv2(tfds.core.GeneratorBasedBuilder):
                     }""",
         )
 
-    def _split_generators(self, dl_manager: tfds.download.DownloadManager):
-        """Define data splits."""
-        data_dir = os.path.expanduser('~/ssv2/')            # Path to .mp4 files
-        labels_dir = os.path.join(data_dir, 'labels/')      # Path to label files
 
-        return [
-            tfds.core.SplitGenerator(
-                name=tfds.Split.TRAIN,
-                gen_kwargs={
-                    'split': 'train',
-                    'data_dir': data_dir,
-                    'label_file': os.path.join(labels_dir, 'train.txt'),
-                    'limit': 1000,  # test with only 1000 first
-                },
-            ),
-            tfds.core.SplitGenerator(
-                name=tfds.Split.VALIDATION,
-                gen_kwargs={
-                    'split': 'validation',
-                    'data_dir': data_dir,
-                    'label_file': os.path.join(labels_dir, 'validation.txt'),
-                    'limit': 200,  # test with only 200 first
-                },
-            ),
-            tfds.core.SplitGenerator(
-                name=tfds.Split.TEST,
-                gen_kwargs={
-                    'split': 'test',
-                    'data_dir': data_dir,
-                    'label_file': os.path.join(labels_dir, 'test-answers.csv'),
-                    'limit': 100,  # test with onl 100 first
-                },
-            ),
-        ]
+    def _split_generators(self, dl_manager: tfds.download.DownloadManager):
+        """Define data splits by invoking _generate_examples for each split."""
+        base_dir = os.path.expanduser('~/ssv2/')  # Base directory containing all data
+
+        # Return a dictionary mapping splits to generator calls
+        return {
+            'train': self._generate_examples(path=base_dir, split='train'),
+            'val': self._generate_examples(path=base_dir, split='validation'),
+            'test': self._generate_examples(path=base_dir, split='test'),
+        }
 
     @lru_cache(maxsize=None)
     def get_language_embedding(self, label: str) -> np.ndarray:
@@ -133,10 +110,10 @@ class Ssv2(tfds.core.GeneratorBasedBuilder):
         assert embedding.shape == (512,), f"Unexpected language_embedding shape: {embedding.shape}"
         return embedding.astype(np.float32)
 
-    def _generate_examples(self, split: str, data_dir: str, label_file: str, limit: int = None) -> Iterator[Tuple[str, Any]]:
+    def _generate_examples(self, path: str, split: str) -> Iterator[Tuple[str, Any]]:
         """Generator of examples for each split."""
-        # Load labels.json to map label_ids to label_strings
-        labels_json_path = os.path.join(os.path.dirname(label_file), 'labels.json')
+        labels_json_path = os.path.join(path, 'labels', 'labels.json')
+
         if not os.path.exists(labels_json_path):
             logger.error(f"labels.json not found at {labels_json_path}.")
             return  # Exit generator
@@ -147,96 +124,104 @@ class Ssv2(tfds.core.GeneratorBasedBuilder):
         # Invert labels.json to map label_id to label_string
         label_id_to_string = {v: k for k, v in labels.items()}
 
-        # Load label mappings from the label file
+        # Determine label file based on split
+        if split == 'train':
+            label_file = os.path.join(path, 'labels', 'train.txt')
+        elif split == 'validation':
+            label_file = os.path.join(path, 'labels', 'validation.txt')
+        elif split == 'test':
+            label_file = os.path.join(path, 'labels', 'test-answers.csv')
+        else:
+            logger.error(f"Unknown split: {split}")
+            return
+
+        # Get video_ids for the current split
+        video_ids = self._get_video_ids(label_file, split)
+
+        for video_id, label_info in video_ids.items():
+            video_filename = f"{video_id}.mp4"
+            video_path = os.path.join(path, video_filename)
+
+            # Determine label
+            if split == 'test':
+                # For test, label_map already contains label_string
+                label_string = label_info
+            else:
+                # For train and validation, map label_id to label_string
+                label_id = label_info
+                label_string = label_id_to_string.get(label_id, "unknown")
+
+            # Extract frames
+            frames = self._extract_frames(video_path)
+
+            # Compute language embedding
+            lang_embedding = self.get_language_embedding(label_string)
+
+            # Assemble episode steps
+            episode_steps = []
+            for i, frame in enumerate(frames):
+                step_data = {
+                    'observation': {
+                        'image': frame,
+                    },
+                    'discount': 1.0,
+                    'reward': float(i == (len(frames) - 1)),
+                    'is_first': i == 0,
+                    'is_last': i == (len(frames) - 1),
+                    'is_terminal': i == (len(frames) - 1),
+                    'language_instruction': label_string,
+                    'language_embedding': lang_embedding,  # 512-dimensional vector
+                }
+                episode_steps.append(step_data)
+
+            # Create output sample
+            sample = {
+                'steps': episode_steps,
+                'episode_metadata': {
+                    'video_id': video_id,
+                    'label': label_string,
+                    'file_path': video_path,
+                },
+            }
+
+            yield video_id, sample
+
+    def _get_video_ids(self, label_file: str, split: str) -> dict:
+        """
+        Internal helper function to parse label files and return a mapping of video_id to label.
+        
+        Args:
+            label_file (str): Path to the label file.
+            split (str): Name of the split ('train', 'validation', 'test').
+
+        Returns:
+            dict: Mapping of video_id to label_id or label_string.
+        """
         label_map = {}
-        if split != 'test':
-            with open(label_file, 'r') as f:
-                for line in f:
+        if not os.path.exists(label_file):
+            logger.error(f"Label file does not exist: {label_file}")
+            return label_map
+
+        with open(label_file, 'r') as f:
+            for line in f:
+                if split == 'test':
+                    # Test label files have format: video_id;label_string
+                    parts = line.strip().split(';')
+                    if len(parts) == 2:
+                        video_id, label_string = parts
+                        label_map[video_id] = label_string
+                    else:
+                        logger.warning(f"Invalid line format in {label_file}: {line.strip()}")
+                else:
+                    # Train and Validation label files have format: video_id label_id
                     parts = line.strip().split()
                     if len(parts) >= 2:
                         video_id, label_id = parts[0], parts[1]
-                        label_string = label_id_to_string.get(label_id, "unknown")
-                        label_map[video_id] = label_string
+                        label_map[video_id] = label_id
                     else:
-                        logger.warning(f"Invalid line format in {label_file}: {line}")
-        else:
-            # For test split, read from test-answers.csv
-            with open(label_file, 'r') as f:
-                for line in f:
-                    parts = line.strip().split(';')
-                    if len(parts) == 2:
-                        video_id, label_string = parts[0], parts[1]
-                        label_map[video_id] = label_string
-                    else:
-                        logger.warning(f"Invalid line format in {label_file}: {line}")
+                        logger.warning(f"Invalid line format in {label_file}: {line.strip()}")
 
-        # Find all .mp4 files in the data directory
-        video_files = glob.glob(os.path.join(data_dir, '*.mp4'))
-
-        processed = 0
-        skipped = 0
-
-        for video_file in video_files:
-            if limit is not None and processed >= limit:
-                break
-            try:
-                video_id = os.path.splitext(os.path.basename(video_file))[0]
-                label = label_map.get(video_id, "unknown" if split == 'test' else None)
-
-                if label is None:
-                    logger.warning(f"No label found for video {video_id} in split '{split}'. Assigning 'unknown'.")
-                    label = "unknown"
-
-                frames = self._extract_frames(video_file)
-
-                if not frames:
-                    logger.warning(f"No frames extracted from {video_file}. Skipping.")
-                    skipped += 1
-                    continue
-
-                # Compute language embedding
-                lang_embedding = self.get_language_embedding(label)
-
-                # Assemble episode steps
-                episode_steps = []
-                for i, frame in enumerate(frames):
-                    step_data = {
-                        'observation': {
-                            'image': frame,
-                        },
-                        'discount': 1.0,
-                        'reward': float(i == (len(frames) - 1)),
-                        'is_first': i == 0,
-                        'is_last': i == (len(frames) - 1),
-                        'is_terminal': i == (len(frames) - 1),
-                        'language_instruction': label,
-                        'language_embedding': lang_embedding,  # 512-dimensional vector
-                    }
-                    episode_steps.append(step_data)
-
-                # Create output sample
-                sample = {
-                    'steps': episode_steps,
-                    'episode_metadata': {
-                        'video_id': video_id,
-                        'label': label,
-                        'file_path': video_file,
-                    },
-                }
-
-                yield video_id, sample
-
-                processed += 1
-
-                if processed % 1000 == 0:
-                    logger.info(f"Processed {processed} videos in split '{split}'.")
-
-            except Exception as e:
-                logger.warning(f"Failed to process {video_file}: {e}")
-                skipped += 1
-                continue
-
-        logger.info(f"Finished processing split '{split}': {processed} processed, {skipped} skipped.")
+        return label_map
 
     def _extract_frames(self, video_path: str, resize: Tuple[int, int] = (224, 224)) -> list:
         """Extract frames from a video file.
